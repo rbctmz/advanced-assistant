@@ -1,0 +1,250 @@
+import os
+import logging
+import signal
+from glob import glob
+from time import sleep
+from threading import Lock
+from typing import Optional
+from dotenv import load_dotenv
+import telebot
+import pandas as pd
+from pydantic import BaseModel, Field
+from tqdm.auto import tqdm
+from yandex_cloud_ml_sdk import YCloudML
+from yandex_cloud_ml_sdk.search_indexes import (
+    StaticIndexChunkingStrategy,
+    HybridSearchIndexType,
+    ReciprocalRankFusionIndexCombinationStrategy,)
+
+# Constants
+TIMEOUT_SECONDS = 30
+MAX_RETRIES = 3
+TTL_DAYS = 1
+CHUNK_SIZE = 600 * 3
+
+logging.basicConfig(
+    filename='new_wine_bot.log',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Global SDK and model instances
+sdk = None
+model = None
+
+class Agent:
+    def __init__(self, assistant=None, instruction=None, search_index=None, tools=None):
+        self.assistant = assistant
+        if instruction:
+            self.assistant.update(instruction=instruction)
+        self.thread = None
+    
+    def __call__(self, message: str, thread=None) -> str:
+        if thread is None:
+            thread = self.thread
+        if thread is None:
+            return "Error: No thread available"
+            
+        try:
+            thread.write(message)
+            run = self.assistant.run(thread)
+            result = run.wait(timeout=TIMEOUT_SECONDS)
+            return result.text if result and result.text else None
+        except Exception as e:
+            logger.error(f"Agent error: {e}")
+            return None
+
+class WineBot:
+    def __init__(self, token: str, sdk_instance: YCloudML, model_instance):
+        self.bot = telebot.TeleBot(token)
+        self.threads = {}
+        self.thread_locks = {}
+        self.shared_assistant = None
+        self.sdk = sdk_instance
+        self.model = model_instance
+        # Initialize wine agent with the assistant
+        self.wine_agent = Agent(
+            assistant=self.get_assistant(),
+            instruction=self.get_instruction()
+        )
+        self.setup_handlers()
+        
+    def setup_handlers(self):
+        @self.bot.message_handler(commands=["start"])
+        def start(message):
+            self._handle_start(message)
+            
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_message(message):
+            self._handle_message(message)
+
+        @self.bot.message_handler(commands=["stop"])
+        def stop(message):
+            self._handell_stop(message)
+    
+    def _handle_start(self, message):
+        try:
+            thread = self.get_or_create_thread(message.chat.id)
+            assistant = self.get_assistant()
+            logger.info(f"Starting on thread {thread.id=}, msg={message.text}")
+            
+            thread.write("Новый пользователь начал разговор")
+            run = assistant.run(thread)
+            result = run.wait(timeout=TIMEOUT_SECONDS)
+            
+            response = result.text if result and result.text else "Здравствуйте! Я - ваш персональный сомелье. Как я могу помочь вам выбрать вино?"
+            self.bot.send_message(message.chat.id, response)
+            
+        except Exception as e:
+            logger.error(f"Error in start handler: {e}")
+            self.bot.send_message(
+                message.chat.id,
+                "Здравствуйте! К сожалению, возникли технические проблемы. Попробуйте начать разговор через минуту."
+            )
+    
+    def _handle_message(self, message):
+        try:
+            thread = self.get_or_create_thread(message.chat.id)
+            logger.info(f"Processing message on thread {thread.id=}, msg={message.text}")
+            
+            # Process message with assistant directly if wine_agent is not available
+            if self.wine_agent is None:
+                assistant = self.get_assistant()
+                with self.thread_locks[message.chat.id]:
+                    self._process_assistant_response(message, thread, assistant)
+                return
+                
+            # Use wine agent if available
+            answer = self.wine_agent(message.text, thread=thread)
+            if answer:
+                logger.info(f"Answer from agent: {answer}")
+                self.bot.send_message(message.chat.id, answer)
+            
+        except Exception as e:
+            logger.error(f"Error in message handler: {e}")
+            self.bot.send_message(
+                message.chat.id,
+                "Произошла ошибка. Пожалуйста, попробуйте через минуту."
+            )
+    
+    def _handle_stop(self, message):
+        thread = self.get_or_create_thread(message.chat.id)
+        thread.delete()
+        del self.threads[message.chat.id]
+        del self.thread_locks[message.chat.id]
+        self.bot.send_message(message.chat.id, "Диалог завершен. Если у вас есть еще вопросы, не стесняйтесь обращаться!")
+        logger.info(f"Stopped thread {thread.id} for chat {message.chat.id}")
+        self.shutdown()
+
+    def get_or_create_thread(self, chat_id: int):
+        """Create new thread for chat or return existing one"""
+        if chat_id not in self.threads:
+            self.threads[chat_id] = self.sdk.threads.create(
+                name=f"Chat {chat_id}", 
+                ttl_days=TTL_DAYS, 
+                expiration_policy="static"
+            )
+            self.thread_locks[chat_id] = Lock()
+            logger.info(f"Created new thread for chat {chat_id}")
+        return self.threads[chat_id]
+
+    def get_assistant(self):
+        """Get or create shared assistant instance"""
+        if not self.shared_assistant:
+            self.shared_assistant = self.sdk.assistants.create(
+                self.model,
+                ttl_days=TTL_DAYS,
+                expiration_policy="since_last_active",
+                instruction=self.get_instruction()
+            )
+            logger.info("Created new shared assistant")
+        return self.shared_assistant
+
+    def get_instruction(self) -> str:
+        """Return the instruction for the assistant"""
+        return """
+        Ты - опытный сомелье, продающий вино в магазине. Твоя задача:
+        - Отвечать на вопросы пользователя про вина
+        - Рекомендовать лучшие вина к еде
+        - Искать вина в прайс-листе магазина
+        - Проактивно предлагать пользователю приобрести вина
+        
+        При старте диалога поинтересуйся потребностями пользователя 
+        и предложи интересный вариант сочетания еды и вина.
+        """
+
+    def shutdown(self):
+        """Gracefully shutdown the bot"""
+        logger.info("Shutting down bot...")
+        self.bot.stop_polling()
+        if self.shared_assistant:
+            self.shared_assistant.delete()
+        for thread in self.threads.values():
+            thread.delete()
+
+    def _process_assistant_response(self, message, thread, assistant):
+        try:
+            thread.write(message.text)
+            run = assistant.run(thread)
+            result = run.wait(timeout=TIMEOUT_SECONDS)
+            
+            if result and result.text:
+                self.bot.send_message(message.chat.id, result.text)
+                logger.info(f"Sent response for thread {thread.id}")
+            else:
+                self._handle_empty_result(message.chat.id, thread.id)
+                
+        except TimeoutError:
+            self._handle_timeout(message.chat.id, thread.id)
+
+    def _handle_empty_result(self, chat_id, thread_id):
+        error_msg = "Не удалось найти подходящее вино. Пожалуйста, уточните ваш запрос."
+        self.bot.send_message(chat_id, error_msg)
+        logger.warning(f"Empty result for thread {thread_id}")
+
+    def _handle_timeout(self, chat_id, thread_id):
+        timeout_msg = "Подбираю для вас вино, пожалуйста, повторите вопрос через минуту."
+        self.bot.send_message(chat_id, timeout_msg)
+        logger.error(f"Timeout on thread {thread_id}")
+
+def main():
+    # Setup logging
+    logging.basicConfig(
+        filename='wine_bot.log',
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
+    
+    # Load environment variables
+    load_dotenv()
+    config = {
+        "folder_id": os.getenv("folder_id"),
+        "api_key": os.getenv("api_key"),
+        "telegram_token": os.getenv("tg_token")
+    }
+    
+    if not all(config.values()):
+        raise ValueError("Please set folder_id, api_key and tg_token in .env file")
+    
+    try:
+        # Initialize SDK and model as global instances
+        global sdk, model
+        sdk = YCloudML(folder_id=config["folder_id"], auth=config["api_key"])
+        model = sdk.models.completions("yandexgpt", model_version="rc")
+        
+        # Initialize bot with SDK and model instances
+        wine_bot = WineBot(config["telegram_token"], sdk, model)
+        
+        # Register signal handler
+        signal.signal(signal.SIGINT, lambda signum, frame: wine_bot.shutdown())
+        
+        print("Bot is running... Press Ctrl+C to exit gracefully")
+        wine_bot.bot.polling(none_stop=True)
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        print(f"Failed to start bot: {e}")
+
+if __name__ == "__main__":
+    main()
